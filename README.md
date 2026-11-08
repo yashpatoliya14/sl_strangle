@@ -13,19 +13,23 @@ Includes real-time **Telegram Bot notifications** and **1-tap interactive button
    - Authenticates via HMAC-SHA256 with automatic server clock drift synchronization.
    - Concurrently executes market close for both legs upon trigger to prevent slippage.
 
-2. **Dynamic Combined Stop-Loss**:
-   - Calculates max profit from the up-and-running Strangle ($6 CE + $4 PE = $10 Max Profit).
-   - Automatically sets Virtual Combined SL to **-$10.00** (1:1 Risk/Reward ratio).
-   - Monitors aggregate Mark-to-Market P&L across both legs.
+2. **Dynamic Combined Stop-Loss & Telegram `sl_set` Button**:
+   - Automatically initializes Virtual Combined SL from the running Strangle (e.g. $10 Max Profit => -$10 SL).
+   - **`⚙️ sl_set` Button**: Tap anytime on Telegram to change your Stop-Loss on the fly (via quick presets `-$5`, `-$10`, `-$15`, `-$20`, or typing any custom amount).
 
-3. **Trailing SL Removed**:
-   - Trailing SL logic has been completely removed to keep execution clean and strictly bound to the initial risk-to-reward ratio.
+3. **5-Alert Sequence at 10-Minute Intervals**:
+   - When overall strangle loss reaches your SL threshold:
+     - **Alert 1 of 5**: Sent immediately upon breach.
+     - **Alerts 2 to 5**: Sent every 10 minutes (configurable via `SL_ALERT_INTERVAL_MINUTES=10`).
+   - Each alert includes:
+     - Current Net PnL and breached SL level.
+     - Individual Call & Put prices.
+     - **`🚨 Emergency Square Off`**: 1-tap exit on Delta Exchange India.
+     - **`🔕 Silence Alerts`**: Mutes remaining alerts for the current breach.
+   - If PnL recovers above the SL, alerts pause and the bot sends a recovery notification.
 
-4. **Telegram Bot with Interactive Buttons**:
-   - **`🚨 Emergency Square Off`**: 1-tap button to immediately close both legs on Delta India.
-   - **`📊 Live Status`**: Shows Call LTP, Put LTP, current Combined PnL, and distance to SL.
-   - **`💰 Current PnL`**: Displays current profit/loss summary.
-   - Sends instant alerts when Virtual SL is breached or Target Profit is achieved.
+4. **Trailing SL Removed**:
+   - Trailing SL logic has been completely removed to keep execution clean and strictly bound to the user-defined Stop-Loss.
 
 ---
 
@@ -83,19 +87,42 @@ PUT_SYMBOL=P-BTC-80000-280226
 
 ---
 
-## 🚀 How to Run
+## 🚀 Deployment & Continuous Integration (VPS)
 
-1. **Install dependencies**:
-   ```bash
-   npm install
-   ```
+Referenced directly from the `funding` bot deployment architecture.
 
-2. **Run the engine**:
-   ```bash
-   node index.js
-   ```
+### 1. GitHub Actions Secrets (Repo Settings)
+Go to your GitHub repository **Settings -> Secrets and variables -> Actions** and add:
 
-3. **Telegram Commands & Buttons**:
-   - `🚨 Emergency Square Off` / `/flatten` : Instantly closes both legs.
-   - `📊 Live Status` / `/status` : Displays current prices, PnL, and SL buffer.
-   - `💰 Current PnL` / `/pnl` : Shows current PnL.
+| Secret Name | Description | Example |
+|---|---|---|
+| `VM_HOST` | Public IP or domain of your remote Linux VPS | `159.65.123.45` |
+| `VM_USER` | SSH Username on the VPS | `root` or `ubuntu` |
+| `VM_PORT` | SSH Port | `22` |
+| `VM_SSH_KEY` | Private SSH key (id_rsa or id_ed25519) | `-----BEGIN OPENSSH PRIVATE KEY...` |
+
+### 2. Automated GitHub Actions Deploy ([`.github/workflows/deploy.yml`](file:///c:/Users/yashp/Desktop/SL/.github/workflows/deploy.yml))
+Whenever code is pushed to `main` or `master`:
+1. Validates the required VM SSH credentials.
+2. Connects to your VPS via SSH (`appleboy/ssh-action@v1`).
+3. Executes [`deploy.sh`](file:///c:/Users/yashp/Desktop/SL/deploy.sh), which installs dependencies and restarts the `strangle-sl` systemd service.
+
+### 3. Manual Server Commands
+- **Run deployment manually**:
+  ```bash
+  chmod +x deploy.sh
+  ./deploy.sh
+  ```
+- **Check service status**:
+  ```bash
+  systemctl status strangle-sl
+  ```
+- **Stream live logs**:
+  ```bash
+  journalctl -u strangle-sl -f
+  ```
+- **Restart or Stop**:
+  ```bash
+  systemctl restart strangle-sl
+  systemctl stop strangle-sl
+  ```

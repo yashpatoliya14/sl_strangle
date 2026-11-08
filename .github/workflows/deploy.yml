@@ -1,0 +1,56 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches:
+      - master
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate deploy secrets
+        run: |
+          test -n "${{ secrets.VM_HOST }}" || (echo "VM_HOST is missing" && exit 1)
+          test -n "${{ secrets.VM_USER }}" || (echo "VM_USER is missing" && exit 1)
+          test -n "${{ secrets.VM_PORT }}" || (echo "VM_PORT is missing" && exit 1)
+          test -n "${{ secrets.VM_SSH_KEY }}" || (echo "VM_SSH_KEY is missing" && exit 1)
+
+      - name: Deploy to VM
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          port: ${{ secrets.VM_PORT }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            TARGET_DIR=""
+            if [ -d "/root/strangle-sl" ]; then
+              TARGET_DIR="/root/strangle-sl"
+            elif [ -d "/root/SL" ]; then
+              TARGET_DIR="/root/SL"
+            elif [ -d "${HOME}/strangle-sl" ]; then
+              TARGET_DIR="${HOME}/strangle-sl"
+            elif [ -d "${HOME}/SL" ]; then
+              TARGET_DIR="${HOME}/SL"
+            fi
+
+            if [ -n "$TARGET_DIR" ]; then
+              cd "$TARGET_DIR"
+              git pull origin master || git pull origin main || true
+              if [ -f deploy.sh ]; then
+                chmod +x deploy.sh
+                ./deploy.sh
+              else
+                npm install --omit=dev
+                systemctl restart strangle-sl || true
+              fi
+            elif [ -f ~/deploy.sh ]; then
+              chmod +x ~/deploy.sh
+              ~/deploy.sh
+            else
+              echo "Error: Target directory not found on VM!"
+              exit 1
+            fi
