@@ -7,12 +7,13 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/root/strangle-sl
+WorkingDirectory=/root/sl_strangle
 Environment=NODE_ENV=production
-EnvironmentFile=-/root/strangle-sl/.env
+EnvironmentFile=-/root/sl_strangle/.env
+Environment=PATH=/root/.nvm/versions/node/v24.21.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Node binary path
-ExecStart=/usr/bin/node index.js
+# Node executable path on your VPS
+ExecStart=/root/.nvm/versions/node/v24.21.0/bin/node index.js
 
 # Graceful stop
 KillSignal=SIGINT

@@ -27,10 +27,14 @@ jobs:
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
             TARGET_DIR=""
-            if [ -d "/root/strangle-sl" ]; then
+            if [ -d "/root/sl_strangle" ]; then
+              TARGET_DIR="/root/sl_strangle"
+            elif [ -d "/root/strangle-sl" ]; then
               TARGET_DIR="/root/strangle-sl"
             elif [ -d "/root/SL" ]; then
               TARGET_DIR="/root/SL"
+            elif [ -d "${HOME}/sl_strangle" ]; then
+              TARGET_DIR="${HOME}/sl_strangle"
             elif [ -d "${HOME}/strangle-sl" ]; then
               TARGET_DIR="${HOME}/strangle-sl"
             elif [ -d "${HOME}/SL" ]; then

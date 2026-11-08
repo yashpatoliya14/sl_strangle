@@ -6,14 +6,18 @@
 set -euo pipefail
 
 # Auto-detect application directory
-if [ -d "/root/SL" ]; then
-    APP_DIR="/root/SL"
+if [ -d "/root/sl_strangle" ]; then
+    APP_DIR="/root/sl_strangle"
 elif [ -d "/root/strangle-sl" ]; then
     APP_DIR="/root/strangle-sl"
-elif [ -d "${HOME}/SL" ]; then
-    APP_DIR="${HOME}/SL"
+elif [ -d "/root/SL" ]; then
+    APP_DIR="/root/SL"
+elif [ -d "${HOME}/sl_strangle" ]; then
+    APP_DIR="${HOME}/sl_strangle"
 elif [ -d "${HOME}/strangle-sl" ]; then
     APP_DIR="${HOME}/strangle-sl"
+elif [ -d "${HOME}/SL" ]; then
+    APP_DIR="${HOME}/SL"
 else
     APP_DIR="$(pwd)"
 fi
