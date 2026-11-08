@@ -1,7 +1,9 @@
 /**
  * deltaClient.js
  * Dedicated Delta Exchange India REST API Client
- * Fetches overall portfolio positions and calculates total net PnL in real time.
+ * 
+ * Exclusively tracks UNREALIZED PnL across active open positions.
+ * Booked / Realized PnL is completely excluded from Stop-Loss triggers.
  */
 
 const axios = require('axios');
@@ -67,8 +69,9 @@ class DeltaExchangeClient {
   }
 
   /**
-   * Calculates overall net portfolio PnL across all open positions on Delta India
-   * @returns {Promise<{totalPnL: number, positionsCount: number, details: Array}>}
+   * Calculates overall UNREALIZED PnL across active open positions on Delta India.
+   * NOTE: Realized / Booked PnL is strictly ignored.
+   * @returns {Promise<{totalUnrealizedPnL: number, positionsCount: number, details: Array}>}
    */
   async getOverallPortfolioPnL() {
     if (this.isDryRun) {
@@ -78,7 +81,7 @@ class DeltaExchangeClient {
     const positions = await this.getOpenPositions();
     const activePositions = positions.filter(p => Number(p.size) !== 0);
 
-    let totalPnL = 0;
+    let totalUnrealizedPnL = 0;
     const details = [];
 
     for (const pos of activePositions) {
@@ -86,18 +89,18 @@ class DeltaExchangeClient {
       const entryPrice = Number(pos.entry_price || 0);
       const markPrice = Number(pos.mark_price || entryPrice);
 
-      // Prefer unrealized_pnl if returned directly by Delta API
-      let posPnL = 0;
+      // STRICTLY Unrealized PnL (Booked / Realized PnL is ignored!)
+      let unrealizedPnL = 0;
       if (pos.unrealized_pnl !== undefined && pos.unrealized_pnl !== null) {
-        posPnL = Number(pos.unrealized_pnl);
+        unrealizedPnL = Number(pos.unrealized_pnl);
       } else {
-        // Fallback calculation
-        posPnL = size > 0 
+        // Fallback formula: (mark - entry) for long, (entry - mark) for short
+        unrealizedPnL = size > 0 
           ? (markPrice - entryPrice) * size 
           : (entryPrice - markPrice) * Math.abs(size);
       }
 
-      totalPnL += posPnL;
+      totalUnrealizedPnL += unrealizedPnL;
 
       details.push({
         symbol: pos.product_symbol || `Product-${pos.product_id}`,
@@ -106,19 +109,20 @@ class DeltaExchangeClient {
         side: size > 0 ? 'BUY' : 'SELL',
         entryPrice,
         markPrice,
-        pnl: posPnL
+        unrealizedPnL: Number(unrealizedPnL.toFixed(2))
       });
     }
 
     return {
-      totalPnL: Number(totalPnL.toFixed(2)),
+      totalUnrealizedPnL: Number(totalUnrealizedPnL.toFixed(2)),
+      totalPnL: Number(totalUnrealizedPnL.toFixed(2)), // For backward compatibility
       positionsCount: activePositions.length,
       details
     };
   }
 
   /**
-   * Emergency Flatten: Closes all active positions on Delta India
+   * Emergency Flatten: Closes all active open positions on Delta India
    */
   async closeAllPositions() {
     console.log('[DeltaClient] Initiating Emergency Close for all open positions...');
@@ -155,48 +159,49 @@ class DeltaExchangeClient {
 
   // ==========================================
   // Mock Simulation Helpers (DRY_RUN)
+  // Simulates floating UNREALIZED PnL
   // ==========================================
   _simulateMockPortfolio() {
     this.mockIteration += 1;
     const iter = this.mockIteration;
 
-    let callPnL = 0;
-    let putPnL = 0;
+    let callUnrealized = 0;
+    let putUnrealized = 0;
 
     if (iter === 1) {
-      callPnL = +0.50; putPnL = +0.50; // Total: +$1.00
+      callUnrealized = +0.50; putUnrealized = +0.50; // Total: +$1.00
     } else if (iter === 2) {
-      callPnL = +1.00; putPnL = +1.00; // Total: +$2.00
+      callUnrealized = +1.00; putUnrealized = +1.00; // Total: +$2.00
     } else if (iter === 3) {
-      callPnL = -2.00; putPnL = +1.00; // Total: -$1.00
+      callUnrealized = -2.00; putUnrealized = +1.00; // Total: -$1.00
     } else if (iter === 4) {
-      callPnL = -6.00; putPnL = +1.00; // Total: -$5.00
+      callUnrealized = -6.00; putUnrealized = +1.00; // Total: -$5.00
     } else if (iter === 5) {
-      callPnL = -10.50; putPnL = +3.50; // Total: -$7.00
+      callUnrealized = -10.50; putUnrealized = +3.50; // Total: -$7.00
     } else {
-      // Reaches -$10.20 (Breaches -$10.00 SL)
-      callPnL = -14.00; putPnL = +3.80; // Total: -$10.20
+      // Reaches -$10.20 Unrealized Loss
+      callUnrealized = -14.00; putUnrealized = +3.80; // Total: -$10.20
     }
 
-    const totalPnL = Number((callPnL + putPnL).toFixed(2));
+    const totalUnrealizedPnL = Number((callUnrealized + putUnrealized).toFixed(2));
 
     return {
-      totalPnL,
+      totalUnrealizedPnL,
+      totalPnL: totalUnrealizedPnL,
       positionsCount: 2,
       details: [
-        { symbol: 'C-BTC-90000', size: -1, entryPrice: 6.00, markPrice: 6.00 - callPnL, pnl: callPnL },
-        { symbol: 'P-BTC-80000', size: -1, entryPrice: 4.00, markPrice: 4.00 - putPnL, pnl: putPnL }
+        { symbol: 'C-BTC-90000', size: -1, entryPrice: 6.00, markPrice: 6.00 - callUnrealized, unrealizedPnL: callUnrealized },
+        { symbol: 'P-BTC-80000', size: -1, entryPrice: 4.00, markPrice: 4.00 - putUnrealized, unrealizedPnL: putUnrealized }
       ]
     };
   }
 
   _getMockPositions() {
     return [
-      { product_id: 101, product_symbol: 'C-BTC-90000', size: -1, entry_price: 6.00, mark_price: 6.00 },
-      { product_id: 102, product_symbol: 'P-BTC-80000', size: -1, entry_price: 4.00, mark_price: 4.00 }
+      { product_id: 101, product_symbol: 'C-BTC-90000', size: -1, entry_price: 6.00, mark_price: 6.00, unrealized_pnl: 0, realized_pnl: 25.00 },
+      { product_id: 102, product_symbol: 'P-BTC-80000', size: -1, entry_price: 4.00, mark_price: 4.00, unrealized_pnl: 0, realized_pnl: 10.00 }
     ];
   }
 }
 
 module.exports = { DeltaExchangeClient };
-

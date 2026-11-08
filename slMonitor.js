@@ -2,9 +2,10 @@
  * slMonitor.js
  * Stop-Loss Monitor for Delta Exchange India + Telegram
  * 
- * - Polls Delta Exchange India every 1 minute to check overall portfolio PnL.
- * - Monitors Stop-Loss level (default -$10 or customized live via Telegram 'sl_set').
- * - Triggers 5 alerts at 10-minute intervals upon SL breach.
+ * - Strictly monitors UNREALIZED PnL on Delta Exchange India (1-minute interval).
+ * - Realized / booked profits or losses are completely excluded.
+ * - Supports arbitrary custom Stop-Loss values set live via Telegram ('sl_set' or direct chat).
+ * - Sends 5 alerts at 10-minute intervals upon Stop-Loss breach.
  */
 
 class SLMonitor {
@@ -17,9 +18,9 @@ class SLMonitor {
     this.delta = deltaClient;
     this.telegram = telegram;
 
-    // Stop-Loss amount (e.g. 10 means -$10.00 loss threshold)
+    // Custom Stop-Loss amount (e.g. 10 means -$10.00 loss threshold, 12.5 means -$12.50)
     this.slAmount = Number(options.defaultSlAmount ?? process.env.DEFAULT_SL_AMOUNT ?? 10);
-    this.virtualSL = -Math.abs(this.slAmount); // -$10.00
+    this.virtualSL = -Math.abs(this.slAmount);
 
     // Alert Sequence Settings
     this.slAlertIntervalMinutes = Number(options.slAlertIntervalMinutes ?? process.env.SL_ALERT_INTERVAL_MINUTES ?? 10);
@@ -29,7 +30,8 @@ class SLMonitor {
     this.pollIntervalMs = Number(options.pollIntervalMs ?? process.env.POLL_INTERVAL_MS ?? 60000);
 
     // Live State
-    this.currentPnL = 0;
+    this.currentUnrealizedPnL = 0;
+    this.currentPnL = 0; // alias
     this.positionsCount = 0;
     this.positionsDetails = [];
     this.isSlBreached = false;
@@ -49,8 +51,9 @@ class SLMonitor {
     console.log('\n============================================================');
     console.log('   🚀 DELTA INDIA STOP-LOSS MONITOR & TELEGRAM BOT ACTIVE   ');
     console.log('============================================================');
-    console.log(` ▸ Check Frequency   : Every ${(this.pollIntervalMs / 1000).toFixed(0)} seconds (1 min)`);
-    console.log(` ▸ Active Stop-Loss  : -$${this.slAmount.toFixed(2)} (Adjustable via 'sl_set')`);
+    console.log(` ▸ Check Frequency   : Every ${(this.pollIntervalMs / 1000).toFixed(0)}s (1 min)`);
+    console.log(` ▸ Monitored Value   : UNREALIZED PnL ONLY (Booked PnL Ignored)`);
+    console.log(` ▸ Custom Stop-Loss  : -$${this.slAmount.toFixed(2)} (Customizable live via Telegram)`);
     console.log(` ▸ Alert Interval    : Every ${this.slAlertIntervalMinutes} minutes`);
     console.log(` ▸ Max Alerts Limit  : ${this.maxAlerts} alerts`);
     console.log('============================================================\n');
@@ -76,28 +79,29 @@ class SLMonitor {
   }
 
   /**
-   * 1-Minute Check: Fetches overall portfolio PnL from Delta Exchange India
+   * 1-Minute Check: Fetches UNREALIZED portfolio PnL from Delta Exchange India
    */
   async _checkPortfolio() {
     if (!this.isRunning) return;
 
     try {
-      // 1. Fetch live overall portfolio PnL from Delta Exchange India
+      // 1. Fetch live UNREALIZED portfolio PnL
       const result = await this.delta.getOverallPortfolioPnL();
-      this.currentPnL = result.totalPnL;
+      this.currentUnrealizedPnL = result.totalUnrealizedPnL;
+      this.currentPnL = this.currentUnrealizedPnL;
       this.positionsCount = result.positionsCount;
       this.positionsDetails = result.details;
 
       const time = new Date().toLocaleTimeString();
-      const sign = this.currentPnL >= 0 ? '+' : '';
+      const sign = this.currentUnrealizedPnL >= 0 ? '+' : '';
       console.log(
-        `[${time}] Delta India Portfolio PnL: ${sign}$${this.currentPnL.toFixed(2)} | ` +
-        `Active SL: -$${this.slAmount.toFixed(2)} | Open Positions: ${this.positionsCount}` +
+        `[${time}] Delta India Unrealized PnL: ${sign}$${this.currentUnrealizedPnL.toFixed(2)} | ` +
+        `Custom SL: -$${this.slAmount.toFixed(2)} | Open Positions: ${this.positionsCount}` +
         (this.isSlBreached ? ` [ALERTS: ${this.alertsSent}/${this.maxAlerts}]` : '')
       );
 
-      // 2. Check if portfolio loss reaches or breaches Stop-Loss
-      if (this.currentPnL <= this.virtualSL) {
+      // 2. Check if UNREALIZED loss reaches or breaches the Stop-Loss
+      if (this.currentUnrealizedPnL <= this.virtualSL) {
         const now = Date.now();
         const alertIntervalMs = this.slAlertIntervalMinutes * 60 * 1000;
 
@@ -118,8 +122,8 @@ class SLMonitor {
           this.lastAlertTimestamp = now;
 
           console.log('\n🚨 ============================================================');
-          console.log(`🚨 [ALERT ${this.alertsSent}/${this.maxAlerts}] STOP-LOSS BREACHED!`);
-          console.log(`   Portfolio PnL: $${this.currentPnL.toFixed(2)} <= Stop-Loss: -$${this.slAmount.toFixed(2)}`);
+          console.log(`🚨 [ALERT ${this.alertsSent}/${this.maxAlerts}] UNREALIZED STOP-LOSS BREACHED!`);
+          console.log(`   Unrealized PnL: $${this.currentUnrealizedPnL.toFixed(2)} <= Custom SL: -$${this.slAmount.toFixed(2)}`);
           if (this.alertsSent < this.maxAlerts) {
             console.log(`   Next alert in ${this.slAlertIntervalMinutes} minutes.`);
           }
@@ -130,7 +134,7 @@ class SLMonitor {
             await this.telegram.sendSlBreachAlert({
               alertNumber: this.alertsSent,
               maxAlerts: this.maxAlerts,
-              currentPnL: this.currentPnL,
+              currentUnrealizedPnL: this.currentUnrealizedPnL,
               slAmount: this.slAmount,
               positionsCount: this.positionsCount,
               details: this.positionsDetails,
@@ -143,21 +147,21 @@ class SLMonitor {
           if (this.telegram && this.telegram.enabled) {
             await this.telegram.sendMessage(
               `⚠️ *SL Alert Limit Reached (${this.maxAlerts}/${this.maxAlerts})*\n\n` +
-              `Portfolio is still in breach at \`$${this.currentPnL.toFixed(2)}\` (SL: -$${this.slAmount.toFixed(2)}).\n` +
-              `No further automated alerts will be sent unless reset.`
+              `Unrealized loss is still in breach at \`$${this.currentUnrealizedPnL.toFixed(2)}\` (SL: -$${this.slAmount.toFixed(2)}).\n` +
+              `No further automated alerts will be sent unless reset or SL is updated.`
             );
           }
         }
       } else {
-        // Portfolio recovered above Stop-Loss
+        // Unrealized PnL recovered above Stop-Loss
         if (this.isSlBreached) {
-          console.log(`\n🟢 [RECOVERY] Portfolio recovered above SL: $${this.currentPnL.toFixed(2)} > -$${this.slAmount.toFixed(2)}`);
+          console.log(`\n🟢 [RECOVERY] Unrealized PnL recovered above SL: $${this.currentUnrealizedPnL.toFixed(2)} > -$${this.slAmount.toFixed(2)}`);
           if (this.telegram && this.telegram.enabled && this.alertsSent > 0) {
-            const sign = this.currentPnL >= 0 ? '+' : '';
+            const sign = this.currentUnrealizedPnL >= 0 ? '+' : '';
             await this.telegram.sendMessage(
-              `🟢 *Portfolio Recovered Above SL*\n\n` +
-              `• Current PnL: \`${sign}$${this.currentPnL.toFixed(2)}\`\n` +
-              `• Stop-Loss Limit: \`-$${this.slAmount.toFixed(2)}\`\n\n` +
+              `🟢 *Unrealized PnL Recovered Above SL*\n\n` +
+              `• Current Unrealized PnL: \`${sign}$${this.currentUnrealizedPnL.toFixed(2)}\`\n` +
+              `• Active Stop-Loss: \`-$${this.slAmount.toFixed(2)}\`\n\n` +
               `Alert sequence has been paused and reset.`
             );
           }
@@ -168,30 +172,31 @@ class SLMonitor {
         }
       }
     } catch (err) {
-      console.error('[SL Monitor] Error checking Delta India portfolio:', err.message);
+      console.error('[SL Monitor] Error checking Delta India unrealized PnL:', err.message);
     }
   }
 
   /**
-   * Updates the Stop-Loss amount (called from Telegram 'sl_set')
+   * Sets ANY custom Stop-Loss value (e.g. 10, 12.5, 25, 0.75, etc.)
+   * @param {number|string} newAmount - Custom dollar amount
    */
   updateVirtualSL(newAmount) {
-    const numeric = Math.abs(Number(newAmount));
+    const numeric = Math.abs(parseFloat(newAmount));
     if (isNaN(numeric) || numeric <= 0) {
-      throw new Error('Invalid Stop-Loss amount.');
+      throw new Error(`Invalid custom Stop-Loss value: "${newAmount}". Please provide a positive number.`);
     }
 
-    this.slAmount = numeric;
-    this.virtualSL = -numeric;
+    this.slAmount = Number(numeric.toFixed(2));
+    this.virtualSL = -this.slAmount;
 
-    // Reset alert tracking for the new SL level
+    // Reset alert tracking for the new custom SL level
     this.isSlBreached = false;
     this.alertsSent = 0;
     this.lastAlertTimestamp = 0;
     this.alertsSilenced = false;
     this.maxAlertsNoticeSent = false;
 
-    console.log(`[SL Engine] Stop-Loss updated to: -$${this.slAmount.toFixed(2)}`);
+    console.log(`[SL Engine] Custom Stop-Loss updated to: -$${this.slAmount.toFixed(2)}`);
     return this.virtualSL;
   }
 
@@ -218,7 +223,7 @@ class SLMonitor {
   }
 
   /**
-   * Emergency Square-off of all positions on Delta India
+   * Emergency Square-off of all open positions on Delta India
    */
   async emergencySquareOff() {
     console.log('[SL Engine] Executing emergency square-off on Delta India...');
@@ -231,26 +236,26 @@ class SLMonitor {
    * Format Live Status for Telegram
    */
   getStatusSummary() {
-    const sign = this.currentPnL >= 0 ? '+' : '';
-    const distanceToSL = Math.abs(this.currentPnL - this.virtualSL);
+    const sign = this.currentUnrealizedPnL >= 0 ? '+' : '';
+    const distanceToSL = Math.abs(this.currentUnrealizedPnL - this.virtualSL);
     const statusText = this.isSlBreached ? '🚨 SL BREACHED' : '🟢 NORMAL';
 
     let detailsStr = '';
     if (this.positionsDetails && this.positionsDetails.length > 0) {
-      detailsStr = '\n\n*Open Positions:*\n' + this.positionsDetails.map(p => {
-        const pSign = p.pnl >= 0 ? '+' : '';
-        return `• \`${p.symbol}\` (${p.side} ${Math.abs(p.size)}): ${pSign}$${p.pnl.toFixed(2)}`;
+      detailsStr = '\n\n*Open Positions (Unrealized):*\n' + this.positionsDetails.map(p => {
+        const pSign = p.unrealizedPnL >= 0 ? '+' : '';
+        return `• \`${p.symbol}\` (${p.side} ${Math.abs(p.size)}): ${pSign}$${p.unrealizedPnL.toFixed(2)}`;
       }).join('\n');
     }
 
     return (
-      `📊 *Delta India Portfolio Status*\n\n` +
+      `📊 *Delta India Unrealized PnL Status*\n\n` +
       `• *Status:* ${statusText}\n` +
-      `• *Total Portfolio PnL:* \`${sign}$${this.currentPnL.toFixed(2)}\`\n` +
-      `• *Active Stop-Loss:* \`-$${this.slAmount.toFixed(2)}\`\n` +
-      `• *Distance to SL:* \`$${distanceToSL.toFixed(2)}\`\n` +
+      `• *Unrealized PnL:* \`${sign}$${this.currentUnrealizedPnL.toFixed(2)}\` _(Booked PnL ignored)_\n` +
+      `• *Custom Stop-Loss:* \`-$${this.slAmount.toFixed(2)}\`\n` +
+      `• *Buffer to SL:* \`$${distanceToSL.toFixed(2)}\`\n` +
       `• *Alerts Sent:* \`${this.alertsSent}/${this.maxAlerts}\` (Interval: ${this.slAlertIntervalMinutes}m)\n` +
-      `• *Check Frequency:* \`1 minute\`` +
+      `• *Check Interval:* \`1 minute\`` +
       detailsStr
     );
   }
