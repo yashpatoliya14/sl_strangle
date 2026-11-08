@@ -2,8 +2,10 @@
  * deltaClient.js
  * Dedicated Delta Exchange India REST API Client
  * 
- * Exclusively tracks UNREALIZED PnL across active open positions.
- * Booked / Realized PnL is completely excluded from Stop-Loss triggers.
+ * - Checks BOTH /v2/positions and /v2/positions/margined to capture all active positions.
+ * - Resolves live mark price from /v2/tickers if position mark_price is missing.
+ * - Strictly evaluates UNREALIZED PnL. Booked / Realized PnL is completely ignored.
+ * - Provides detailed diagnostic logging and error tracking for Telegram status.
  */
 
 const axios = require('axios');
@@ -43,34 +45,97 @@ class DeltaExchangeClient {
       }
     );
 
+    this.lastFetchInfo = {
+      timestamp: null,
+      success: false,
+      rawCount: 0,
+      activeCount: 0,
+      totalUnrealizedPnL: 0,
+      error: null
+    };
+
     // Mock State for DRY_RUN testing
     this.mockIteration = 0;
   }
 
   /**
-   * Fetch open margined positions from Delta Exchange India
+   * Fetch open positions from Delta Exchange India.
+   * Checks both /v2/positions and /v2/positions/margined to ensure no positions are missed.
    */
   async getOpenPositions() {
     if (this.isDryRun) {
       return this._getMockPositions();
     }
 
-    const path = '/v2/positions/margined';
-    const headers = DeltaAuth.sign(this.apiKey, this.apiSecret, 'GET', path);
+    if (!this.apiKey || !this.apiSecret) {
+      throw new Error('DELTA_API_KEY or DELTA_API_SECRET is missing in .env');
+    }
 
+    let positions = [];
+    let lastError = null;
+
+    // 1. Try standard /v2/positions first
     try {
+      const path = '/v2/positions';
+      const headers = DeltaAuth.sign(this.apiKey, this.apiSecret, 'GET', path);
       const resp = await this.http.get(path, { headers });
-      return resp.data?.result || [];
+      const res = resp.data?.result || resp.data || [];
+      if (Array.isArray(res) && res.length > 0) {
+        positions = res;
+      }
     } catch (err) {
-      const msg = err.response?.data?.message || err.message;
-      console.error('[DeltaClient] Failed to fetch open positions:', msg);
-      throw new Error(`Delta Exchange getOpenPositions error: ${msg}`);
+      lastError = err;
+    }
+
+    // 2. If /v2/positions returned empty or failed, try /v2/positions/margined
+    if (!positions || positions.length === 0) {
+      try {
+        const path = '/v2/positions/margined';
+        const headers = DeltaAuth.sign(this.apiKey, this.apiSecret, 'GET', path);
+        const resp = await this.http.get(path, { headers });
+        const res = resp.data?.result || resp.data || [];
+        if (Array.isArray(res) && res.length > 0) {
+          positions = res;
+        }
+      } catch (err) {
+        if (!lastError) lastError = err;
+      }
+    }
+
+    if (positions.length === 0 && lastError) {
+      const status = lastError.response?.status;
+      const errorData = lastError.response?.data?.error;
+      let msg = '';
+      if (errorData?.code === 'ip_not_whitelisted_for_api_key') {
+        const clientIp = errorData?.context?.client_ip || 'Your IP';
+        msg = `IP Not Whitelisted! Please whitelist ${clientIp} in your Delta Exchange India API Key settings.`;
+      } else if (errorData && typeof errorData === 'object') {
+        msg = errorData.message || JSON.stringify(errorData);
+      } else {
+        msg = lastError.response?.data?.message || lastError.message;
+      }
+      throw new Error(`Delta API (${status || 'Error'}): ${msg}`);
+    }
+
+    return positions;
+  }
+
+  /**
+   * Fetch latest tickers for product mark prices
+   */
+  async getTickers() {
+    try {
+      const resp = await this.http.get('/v2/tickers');
+      return resp.data?.result || resp.data || [];
+    } catch (err) {
+      console.warn('[DeltaClient] Could not fetch tickers:', err.message);
+      return [];
     }
   }
 
   /**
    * Calculates overall UNREALIZED PnL across active open positions on Delta India.
-   * NOTE: Realized / Booked PnL is strictly ignored.
+   * Booked / Realized PnL is completely excluded.
    * @returns {Promise<{totalUnrealizedPnL: number, positionsCount: number, details: Array}>}
    */
   async getOverallPortfolioPnL() {
@@ -78,47 +143,114 @@ class DeltaExchangeClient {
       return this._simulateMockPortfolio();
     }
 
-    const positions = await this.getOpenPositions();
-    const activePositions = positions.filter(p => Number(p.size) !== 0);
+    try {
+      const rawPositions = await this.getOpenPositions();
+      
+      // Filter active open positions: size must not be 0
+      const activePositions = (rawPositions || []).filter(p => {
+        const sz = Number(p.size);
+        return !isNaN(sz) && Math.abs(sz) > 0;
+      });
 
-    let totalUnrealizedPnL = 0;
-    const details = [];
+      // Optionally fetch tickers if positions lack mark_price or unrealized_pnl is 0
+      let tickerMap = null;
+      const needsTickers = activePositions.some(p => 
+        (p.unrealized_pnl === undefined || p.unrealized_pnl === null || Number(p.unrealized_pnl) === 0) &&
+        (!p.mark_price || Number(p.mark_price) === Number(p.entry_price))
+      );
 
-    for (const pos of activePositions) {
-      const size = Number(pos.size);
-      const entryPrice = Number(pos.entry_price || 0);
-      const markPrice = Number(pos.mark_price || entryPrice);
-
-      // STRICTLY Unrealized PnL (Booked / Realized PnL is ignored!)
-      let unrealizedPnL = 0;
-      if (pos.unrealized_pnl !== undefined && pos.unrealized_pnl !== null) {
-        unrealizedPnL = Number(pos.unrealized_pnl);
-      } else {
-        // Fallback formula: (mark - entry) for long, (entry - mark) for short
-        unrealizedPnL = size > 0 
-          ? (markPrice - entryPrice) * size 
-          : (entryPrice - markPrice) * Math.abs(size);
+      if (needsTickers && activePositions.length > 0) {
+        try {
+          const tickers = await this.getTickers();
+          tickerMap = new Map();
+          for (const t of tickers) {
+            const sym = t.symbol || t.product_symbol;
+            if (sym) {
+              tickerMap.set(sym, Number(t.mark_price || t.close || t.spot_price));
+            }
+            if (t.product_id) {
+              tickerMap.set(String(t.product_id), Number(t.mark_price || t.close || t.spot_price));
+            }
+          }
+        } catch {
+          // Non-fatal if ticker fetch fails
+        }
       }
 
-      totalUnrealizedPnL += unrealizedPnL;
+      let totalUnrealizedPnL = 0;
+      const details = [];
 
-      details.push({
-        symbol: pos.product_symbol || `Product-${pos.product_id}`,
-        productId: pos.product_id,
-        size,
-        side: size > 0 ? 'BUY' : 'SELL',
-        entryPrice,
-        markPrice,
-        unrealizedPnL: Number(unrealizedPnL.toFixed(2))
-      });
+      for (const pos of activePositions) {
+        const size = Number(pos.size);
+        const entryPrice = Number(pos.entry_price || 0);
+        const sym = pos.product_symbol || (pos.product && pos.product.symbol) || `Product-${pos.product_id}`;
+
+        // Determine Mark Price
+        let markPrice = Number(pos.mark_price || 0);
+        if ((!markPrice || markPrice === 0) && tickerMap) {
+          markPrice = tickerMap.get(sym) || tickerMap.get(String(pos.product_id)) || entryPrice;
+        }
+        if (!markPrice || markPrice === 0) {
+          markPrice = entryPrice;
+        }
+
+        // STRICTLY calculate Unrealized PnL (Booked / Realized PnL is ignored!)
+        let unrealizedPnL = 0;
+        
+        // Priority 1: Check pos.unrealized_pnl from Delta API
+        const rawUnrealized = pos.unrealized_pnl ?? pos.unrealised_pnl ?? pos.pnl ?? pos.unrealized_pnl_usd;
+        if (rawUnrealized !== undefined && rawUnrealized !== null && Number(rawUnrealized) !== 0) {
+          unrealizedPnL = Number(rawUnrealized);
+        } else if (entryPrice > 0 && markPrice > 0) {
+          // Priority 2: Accurate mark-to-market formula:
+          // Long: (Mark - Entry) * Size
+          // Short: (Entry - Mark) * abs(Size)
+          unrealizedPnL = size > 0 
+            ? (markPrice - entryPrice) * size 
+            : (entryPrice - markPrice) * Math.abs(size);
+        }
+
+        totalUnrealizedPnL += unrealizedPnL;
+
+        details.push({
+          symbol: sym,
+          productId: pos.product_id,
+          size,
+          side: size > 0 ? 'BUY' : 'SELL',
+          entryPrice,
+          markPrice,
+          unrealizedPnL: Number(unrealizedPnL.toFixed(2))
+        });
+      }
+
+      totalUnrealizedPnL = Number(totalUnrealizedPnL.toFixed(2));
+
+      this.lastFetchInfo = {
+        timestamp: new Date().toLocaleTimeString(),
+        success: true,
+        rawCount: rawPositions.length,
+        activeCount: activePositions.length,
+        totalUnrealizedPnL,
+        error: null
+      };
+
+      return {
+        totalUnrealizedPnL,
+        totalPnL: totalUnrealizedPnL,
+        positionsCount: activePositions.length,
+        details
+      };
+    } catch (err) {
+      this.lastFetchInfo = {
+        timestamp: new Date().toLocaleTimeString(),
+        success: false,
+        rawCount: 0,
+        activeCount: 0,
+        totalUnrealizedPnL: 0,
+        error: err.message
+      };
+      throw err;
     }
-
-    return {
-      totalUnrealizedPnL: Number(totalUnrealizedPnL.toFixed(2)),
-      totalPnL: Number(totalUnrealizedPnL.toFixed(2)), // For backward compatibility
-      positionsCount: activePositions.length,
-      details
-    };
   }
 
   /**
@@ -142,7 +274,6 @@ class DeltaExchangeClient {
           continue;
         }
 
-        // Native Delta close endpoint
         const path = '/v2/positions/close';
         const body = { product_id: pos.product_id };
         const headers = DeltaAuth.sign(this.apiKey, this.apiSecret, 'POST', path, body);
@@ -159,7 +290,6 @@ class DeltaExchangeClient {
 
   // ==========================================
   // Mock Simulation Helpers (DRY_RUN)
-  // Simulates floating UNREALIZED PnL
   // ==========================================
   _simulateMockPortfolio() {
     this.mockIteration += 1;
@@ -185,6 +315,15 @@ class DeltaExchangeClient {
 
     const totalUnrealizedPnL = Number((callUnrealized + putUnrealized).toFixed(2));
 
+    this.lastFetchInfo = {
+      timestamp: new Date().toLocaleTimeString(),
+      success: true,
+      rawCount: 2,
+      activeCount: 2,
+      totalUnrealizedPnL,
+      error: null
+    };
+
     return {
       totalUnrealizedPnL,
       totalPnL: totalUnrealizedPnL,
@@ -198,8 +337,8 @@ class DeltaExchangeClient {
 
   _getMockPositions() {
     return [
-      { product_id: 101, product_symbol: 'C-BTC-90000', size: -1, entry_price: 6.00, mark_price: 6.00, unrealized_pnl: 0, realized_pnl: 25.00 },
-      { product_id: 102, product_symbol: 'P-BTC-80000', size: -1, entry_price: 4.00, mark_price: 4.00, unrealized_pnl: 0, realized_pnl: 10.00 }
+      { product_id: 101, product_symbol: 'C-BTC-90000', size: -1, entry_price: 6.00, mark_price: 6.00, unrealized_pnl: -2.50 },
+      { product_id: 102, product_symbol: 'P-BTC-80000', size: -1, entry_price: 4.00, mark_price: 4.00, unrealized_pnl: 1.00 }
     ];
   }
 }

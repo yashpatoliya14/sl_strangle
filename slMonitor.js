@@ -31,9 +31,12 @@ class SLMonitor {
 
     // Live State
     this.currentUnrealizedPnL = 0;
-    this.currentPnL = 0; // alias
+    this.currentPnL = 0;
     this.positionsCount = 0;
     this.positionsDetails = [];
+    this.lastCheckTime = null;
+    this.lastError = null;
+
     this.isSlBreached = false;
     this.alertsSent = 0;
     this.lastAlertTimestamp = 0;
@@ -63,6 +66,15 @@ class SLMonitor {
     // Run first check immediately
     await this._checkPortfolio();
 
+    if (this.lastError && this.telegram && this.telegram.enabled) {
+      await this.telegram.sendMessage(
+        `⚠️ *Delta India API Connection Alert*\n\n` +
+        `Could not fetch live positions from Delta Exchange India.\n\n` +
+        `• *Reason:* \`${this.lastError}\`\n\n` +
+        `👉 If using IP restriction, add your server's IP to your API Key settings in the Delta India portal.`
+      );
+    }
+
     // Schedule 1-minute recurring poll
     this.pollTimer = setInterval(() => this._checkPortfolio(), this.pollIntervalMs);
   }
@@ -91,12 +103,13 @@ class SLMonitor {
       this.currentPnL = this.currentUnrealizedPnL;
       this.positionsCount = result.positionsCount;
       this.positionsDetails = result.details;
+      this.lastCheckTime = new Date().toLocaleTimeString();
+      this.lastError = null;
 
-      const time = new Date().toLocaleTimeString();
       const sign = this.currentUnrealizedPnL >= 0 ? '+' : '';
       console.log(
-        `[${time}] Delta India Unrealized PnL: ${sign}$${this.currentUnrealizedPnL.toFixed(2)} | ` +
-        `Custom SL: -$${this.slAmount.toFixed(2)} | Open Positions: ${this.positionsCount}` +
+        `[${this.lastCheckTime}] Delta India Unrealized PnL: ${sign}$${this.currentUnrealizedPnL.toFixed(2)} | ` +
+        `Custom SL: -$${this.slAmount.toFixed(2)} | Active Positions: ${this.positionsCount}` +
         (this.isSlBreached ? ` [ALERTS: ${this.alertsSent}/${this.maxAlerts}]` : '')
       );
 
@@ -172,7 +185,9 @@ class SLMonitor {
         }
       }
     } catch (err) {
-      console.error('[SL Monitor] Error checking Delta India unrealized PnL:', err.message);
+      this.lastError = err.message;
+      this.lastCheckTime = new Date().toLocaleTimeString();
+      console.error(`[${this.lastCheckTime}] [SL Monitor] Error fetching Delta India unrealized PnL:`, err.message);
     }
   }
 
@@ -240,22 +255,32 @@ class SLMonitor {
     const distanceToSL = Math.abs(this.currentUnrealizedPnL - this.virtualSL);
     const statusText = this.isSlBreached ? '🚨 SL BREACHED' : '🟢 NORMAL';
 
+    let apiStatusStr = '🟢 Connected & Active';
+    if (this.lastError) {
+      apiStatusStr = `⚠️ *Error:* \`${this.lastError}\``;
+    }
+
     let detailsStr = '';
     if (this.positionsDetails && this.positionsDetails.length > 0) {
       detailsStr = '\n\n*Open Positions (Unrealized):*\n' + this.positionsDetails.map(p => {
         const pSign = p.unrealizedPnL >= 0 ? '+' : '';
-        return `• \`${p.symbol}\` (${p.side} ${Math.abs(p.size)}): ${pSign}$${p.unrealizedPnL.toFixed(2)}`;
+        return `• \`${p.symbol}\` (${p.side} ${Math.abs(p.size)}): ${pSign}$${p.unrealizedPnL.toFixed(2)} (Mark: ~$${p.markPrice.toFixed(2)})`;
       }).join('\n');
+    } else if (!this.lastError) {
+      detailsStr = '\n\nℹ️ _No active open positions detected on Delta India._';
     }
 
     return (
       `📊 *Delta India Unrealized PnL Status*\n\n` +
+      `• *API Status:* ${apiStatusStr}\n` +
       `• *Status:* ${statusText}\n` +
-      `• *Unrealized PnL:* \`${sign}$${this.currentUnrealizedPnL.toFixed(2)}\` _(Booked PnL ignored)_\n` +
+      `• *Total Unrealized PnL:* \`${sign}$${this.currentUnrealizedPnL.toFixed(2)}\`\n` +
       `• *Custom Stop-Loss:* \`-$${this.slAmount.toFixed(2)}\`\n` +
       `• *Buffer to SL:* \`$${distanceToSL.toFixed(2)}\`\n` +
-      `• *Alerts Sent:* \`${this.alertsSent}/${this.maxAlerts}\` (Interval: ${this.slAlertIntervalMinutes}m)\n` +
-      `• *Check Interval:* \`1 minute\`` +
+      `• *Active Positions:* \`${this.positionsCount}\`\n` +
+      `• *Last Checked:* \`${this.lastCheckTime || 'Just now'}\`\n` +
+      `• *Check Interval:* \`1 minute\`\n` +
+      `_(Booked/realized PnL is completely ignored)_` +
       detailsStr
     );
   }
