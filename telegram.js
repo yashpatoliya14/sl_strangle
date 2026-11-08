@@ -1,7 +1,9 @@
 /**
  * telegram.js
- * Telegram Bot Service with Interactive Buttons & Command Handling
- * Integrates with Delta Exchange India SL Monitor
+ * Telegram Bot Service with Interactive Buttons & Custom SL Handling
+ * 
+ * - Supports setting ANY custom Stop-Loss value (e.g. 7.5, 12.35, 20, 50, etc.).
+ * - Dispatches 5 alerts at 10-minute intervals on Unrealized SL breach.
  */
 
 const axios = require('axios');
@@ -46,27 +48,28 @@ class TelegramService {
   }
 
   /**
-   * Send SL Breach Alert with 1-tap Square-off, Mute and SL change buttons
+   * Send SL Breach Alert with 1-tap Square-off, Mute, and Custom SL change buttons
    */
-  async sendSlBreachAlert({ alertNumber, maxAlerts, currentPnL, slAmount, positionsCount, details, nextIntervalMins }) {
+  async sendSlBreachAlert({ alertNumber, maxAlerts, currentUnrealizedPnL, slAmount, positionsCount, details, nextIntervalMins }) {
     const nextAlertNote = alertNumber < maxAlerts
       ? `⏱️ _Next alert in ${nextIntervalMins} minutes (${alertNumber}/${maxAlerts} alerts)_`
       : `⚠️ _Final alert (${alertNumber}/${maxAlerts}). Automated alerts completed._`;
 
     let posText = '';
     if (details && details.length > 0) {
-      posText = '\n*Active Positions:*\n' + details.map(p => {
-        const pSign = p.pnl >= 0 ? '+' : '';
-        return `• \`${p.symbol}\` (${p.side} ${Math.abs(p.size)}): ${pSign}$${p.pnl.toFixed(2)}`;
+      posText = '\n*Active Open Positions (Unrealized):*\n' + details.map(p => {
+        const pSign = p.unrealizedPnL >= 0 ? '+' : '';
+        return `• \`${p.symbol}\` (${p.side} ${Math.abs(p.size)}): ${pSign}$${p.unrealizedPnL.toFixed(2)}`;
       }).join('\n') + '\n';
     }
 
     const text =
-      `🚨 *[STOP-LOSS ALERT ${alertNumber} of ${maxAlerts}]* 🚨\n\n` +
-      `Your Delta Exchange India portfolio has reached or breached your Stop-Loss!\n\n` +
-      `• *Total Portfolio PnL:* \`$${currentPnL.toFixed(2)}\`\n` +
-      `• *Stop-Loss Limit:* \`-$${slAmount.toFixed(2)}\`\n` +
-      `• *Over SL by:* \`-$${Math.abs(currentPnL - (-slAmount)).toFixed(2)}\`\n` +
+      `🚨 *[UNREALIZED STOP-LOSS ALERT ${alertNumber} of ${maxAlerts}]* 🚨\n\n` +
+      `Your Delta Exchange India active positions reached your custom Stop-Loss!\n\n` +
+      `• *Total Unrealized PnL:* \`$${currentUnrealizedPnL.toFixed(2)}\`\n` +
+      `• *Custom Stop-Loss:* \`-$${slAmount.toFixed(2)}\`\n` +
+      `• *Over SL by:* \`-$${Math.abs(currentUnrealizedPnL - (-slAmount)).toFixed(2)}\`\n` +
+      `_(Note: Booked / realized PnL is completely excluded)_\n` +
       posText + `\n` +
       `${nextAlertNote}\n\n` +
       `_Choose an action below:_`;
@@ -78,7 +81,7 @@ class TelegramService {
           { text: '🔕 Silence Alerts', callback_data: 'SILENCE_ALERTS' }
         ],
         [
-          { text: '⚙️ Change SL (sl_set)', callback_data: 'OPEN_SL_SET' },
+          { text: '⚙️ Change SL (Custom)', callback_data: 'OPEN_SL_SET' },
           { text: '🔄 Reset Alerts', callback_data: 'RESET_ALERTS' }
         ]
       ]
@@ -102,7 +105,7 @@ class TelegramService {
   }
 
   /**
-   * Quick Preset Inline Keyboard for Stop-Loss
+   * Preset Inline Keyboard for Stop-Loss
    */
   getSlPresetInlineKeyboard() {
     return {
@@ -151,11 +154,11 @@ class TelegramService {
 
     // Startup announcement
     await this.sendMessage(
-      '🤖 *Delta India Stop-Loss Monitor Active*\n\n' +
-      `• Checking Portfolio: \`Every 1 minute\`\n` +
-      `• Stop-Loss Limit: \`-$${this.monitor?.slAmount.toFixed(2) || '10.00'}\`\n` +
+      '🤖 *Delta India Unrealized SL Monitor Active*\n\n' +
+      `• Checking Unrealized PnL: \`Every 1 minute\` (Booked PnL ignored)\n` +
+      `• Active Stop-Loss: \`-$${this.monitor?.slAmount.toFixed(2) || '10.00'}\`\n` +
       `• Alert Schedule: \`5 alerts every 10 mins on SL breach\`\n\n` +
-      `Tap *⚙️ sl_set* to change your Stop-Loss anytime!`,
+      `💡 _You can send any custom SL value in chat anytime (e.g. \`/sl 12.5\` or \`15.3\`) or tap *⚙️ sl_set*!_`,
       this.getDefaultReplyKeyboard()
     );
 
@@ -208,54 +211,73 @@ class TelegramService {
     const raw = (input || '').trim();
     const lower = raw.toLowerCase();
 
-    // 1. "sl_set" Button / Command
-    if (lower === 'sl_set' || lower === '⚙️ sl_set' || lower === '/set_sl' || raw === 'OPEN_SL_SET') {
+    // 1. Direct command to set custom SL: e.g. "/sl 12.5" or "sl 7.25" or "/set_sl 15"
+    if (lower.startsWith('/sl ') || lower.startsWith('sl ') || lower.startsWith('/set_sl ') || lower.startsWith('set_sl ')) {
+      const parts = raw.split(/\s+/);
+      if (parts.length > 1) {
+        const customVal = parseFloat(parts[1]);
+        if (!isNaN(customVal) && customVal !== 0 && this.monitor) {
+          const newSL = this.monitor.updateVirtualSL(customVal);
+          await this.sendMessage(
+            `✅ *Custom Stop-Loss set to -$${Math.abs(customVal).toFixed(2)}!*\n\n` +
+            `• Trigger Condition: Total Unrealized Loss $\\le$ \`-$${Math.abs(customVal).toFixed(2)}\`\n` +
+            `• Booked PnL is completely ignored.\n` +
+            `• Check interval: Every 1 min | 5 alerts every 10 mins.`,
+            this.getDefaultReplyKeyboard()
+          );
+          return;
+        }
+      }
+    }
+
+    // 2. "sl_set" Button clicked / Command
+    if (lower === 'sl_set' || lower === '⚙️ sl_set' || lower === '/set_sl' || lower === '/sl' || raw === 'OPEN_SL_SET') {
       this.awaitingSlInput = true;
       const currentSL = this.monitor ? this.monitor.slAmount.toFixed(2) : '10.00';
-      const currentPnL = this.monitor ? this.monitor.currentPnL.toFixed(2) : '0.00';
+      const currentPnL = this.monitor ? this.monitor.currentUnrealizedPnL.toFixed(2) : '0.00';
 
       const promptText =
-        `⚙️ *Set Stop-Loss Limit (Delta India)*\n\n` +
+        `⚙️ *Set Custom Stop-Loss (Delta India)*\n\n` +
         `• Current Stop-Loss: \`-$${currentSL}\`\n` +
-        `• Current Live Portfolio PnL: \`$${currentPnL}\`\n\n` +
-        `👉 *Select a quick preset below, or reply with any number* (e.g. \`10\` or \`15.5\`):`;
+        `• Current Unrealized PnL: \`$${currentPnL}\` _(Booked PnL ignored)_\n\n` +
+        `👉 *Type ANY custom dollar value in chat* (e.g. \`7.5\`, \`12.35\`, \`18\`, \`25.5\`), or select a preset below:`;
 
       await this.sendMessage(promptText, this.getSlPresetInlineKeyboard());
       return;
     }
 
-    // 2. Preset SL Button Selected (e.g. SET_SL:15)
+    // 3. Preset SL Button Selected (e.g. SET_SL:15)
     if (raw.startsWith('SET_SL:')) {
       const amount = parseFloat(raw.replace('SET_SL:', ''));
       if (!isNaN(amount) && amount > 0 && this.monitor) {
         this.monitor.updateVirtualSL(amount);
         this.awaitingSlInput = false;
         await this.sendMessage(
-          `✅ *Stop-Loss Updated to -$${amount.toFixed(2)}!*\n\n` +
-          `Delta India is checked every 1 min. If portfolio loss hits -$${amount.toFixed(2)}, you will receive 5 alerts at 10-minute intervals.`,
+          `✅ *Stop-Loss updated to -$${amount.toFixed(2)}!*\n\n` +
+          `Delta India is checked every 1 min. If Unrealized loss hits -$${amount.toFixed(2)}, you will receive 5 alerts at 10-minute intervals.`,
           this.getDefaultReplyKeyboard()
         );
       }
       return;
     }
 
-    // 3. Emergency Square Off
+    // 4. Emergency Square Off
     if (lower.includes('emergency') || lower.includes('square off') || lower.includes('flatten') || raw === 'FLATTEN') {
       if (!this.monitor) return;
-      await this.sendMessage('🚨 *EMERGENCY EXIT TRIGGERED!* Closing all open positions on Delta Exchange India...');
+      await this.sendMessage('🚨 *EMERGENCY EXIT TRIGGERED!* Closing all active positions on Delta Exchange India...');
       const result = await this.monitor.emergencySquareOff();
       await this.sendMessage(`✅ *Emergency square-off completed:* ${JSON.stringify(result)}`, this.getDefaultReplyKeyboard());
       return;
     }
 
-    // 4. Cancel Input
+    // 5. Cancel Input
     if (raw === 'CANCEL_INPUT') {
       this.awaitingSlInput = false;
       await this.sendMessage('❌ Cancelled.', this.getDefaultReplyKeyboard());
       return;
     }
 
-    // 5. Silence Alerts
+    // 6. Silence Alerts
     if (raw === 'SILENCE_ALERTS') {
       if (this.monitor) {
         this.monitor.silenceAlerts();
@@ -264,7 +286,7 @@ class TelegramService {
       return;
     }
 
-    // 6. Reset Alerts
+    // 7. Reset Alerts
     if (lower.includes('reset') || raw === 'RESET_ALERTS') {
       if (this.monitor) {
         this.monitor.reset();
@@ -273,7 +295,7 @@ class TelegramService {
       return;
     }
 
-    // 7. Status Check
+    // 8. Status Check
     if (lower.includes('status') || lower.includes('live')) {
       if (this.monitor) {
         const statusMsg = this.monitor.getStatusSummary();
@@ -282,15 +304,17 @@ class TelegramService {
       return;
     }
 
-    // 8. Handle numerical input when awaiting SL
-    if (this.awaitingSlInput && !isNaN(parseFloat(raw))) {
-      const amount = Math.abs(parseFloat(raw));
-      if (amount > 0 && this.monitor) {
-        this.monitor.updateVirtualSL(amount);
+    // 9. Handle arbitrary custom numeric input typed in chat (e.g. "12.35" or "-12.35" or "7.5")
+    if (!isNaN(parseFloat(raw))) {
+      const customAmount = Math.abs(parseFloat(raw));
+      if (customAmount > 0 && this.monitor) {
+        this.monitor.updateVirtualSL(customAmount);
         this.awaitingSlInput = false;
         await this.sendMessage(
-          `✅ *Stop-Loss updated to -$${amount.toFixed(2)}!*\n\n` +
-          `You will receive 5 alerts at 10-min intervals if portfolio loss hits -$${amount.toFixed(2)}.`,
+          `✅ *Custom Stop-Loss set to -$${customAmount.toFixed(2)}!*\n\n` +
+          `• Trigger Condition: Total Unrealized Loss $\\le$ \`-$${customAmount.toFixed(2)}\`\n` +
+          `• Booked PnL is completely ignored.\n` +
+          `• You will receive 5 alerts at 10-minute intervals if this limit is reached.`,
           this.getDefaultReplyKeyboard()
         );
         return;
