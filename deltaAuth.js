@@ -49,3 +49,4 @@ class DeltaAuth {
 }
 
 module.exports = { DeltaAuth };
+
