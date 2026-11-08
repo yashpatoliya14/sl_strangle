@@ -1,7 +1,7 @@
 /**
  * telegram.js
- * Standalone Telegram Bot Service for Stop-Loss Management & Live Alerts
- * Features 'sl_set' button and 5-alert sequence at 10-minute intervals.
+ * Telegram Bot Service with Interactive Buttons & Command Handling
+ * Integrates with Delta Exchange India SL Monitor
  */
 
 const axios = require('axios');
@@ -15,7 +15,7 @@ class TelegramService {
     this.isPolling = false;
     this.lastUpdateId = 0;
     this.monitor = null; // Reference to SLMonitor
-    this.awaitingInput = null; // 'SL' or 'PNL'
+    this.awaitingSlInput = false;
   }
 
   setMonitor(monitor) {
@@ -46,29 +46,39 @@ class TelegramService {
   }
 
   /**
-   * Send SL Breach Alert with 1-tap Silence & Edit buttons
+   * Send SL Breach Alert with 1-tap Square-off, Mute and SL change buttons
    */
-  async sendSlBreachAlert({ alertNumber, maxAlerts, currentPnL, slAmount, nextIntervalMins }) {
+  async sendSlBreachAlert({ alertNumber, maxAlerts, currentPnL, slAmount, positionsCount, details, nextIntervalMins }) {
     const nextAlertNote = alertNumber < maxAlerts
       ? `⏱️ _Next alert in ${nextIntervalMins} minutes (${alertNumber}/${maxAlerts} alerts)_`
       : `⚠️ _Final alert (${alertNumber}/${maxAlerts}). Automated alerts completed._`;
 
+    let posText = '';
+    if (details && details.length > 0) {
+      posText = '\n*Active Positions:*\n' + details.map(p => {
+        const pSign = p.pnl >= 0 ? '+' : '';
+        return `• \`${p.symbol}\` (${p.side} ${Math.abs(p.size)}): ${pSign}$${p.pnl.toFixed(2)}`;
+      }).join('\n') + '\n';
+    }
+
     const text =
       `🚨 *[STOP-LOSS ALERT ${alertNumber} of ${maxAlerts}]* 🚨\n\n` +
-      `Your portfolio has reached or breached your Stop-Loss!\n\n` +
-      `• *Current Net PnL:* \`$${currentPnL.toFixed(2)}\`\n` +
+      `Your Delta Exchange India portfolio has reached or breached your Stop-Loss!\n\n` +
+      `• *Total Portfolio PnL:* \`$${currentPnL.toFixed(2)}\`\n` +
       `• *Stop-Loss Limit:* \`-$${slAmount.toFixed(2)}\`\n` +
-      `• *Breach Amount:* \`-$${Math.abs(currentPnL - (-slAmount)).toFixed(2)}\`\n\n` +
+      `• *Over SL by:* \`-$${Math.abs(currentPnL - (-slAmount)).toFixed(2)}\`\n` +
+      posText + `\n` +
       `${nextAlertNote}\n\n` +
       `_Choose an action below:_`;
 
     const replyMarkup = {
       inline_keyboard: [
         [
-          { text: '🔕 Silence Alerts', callback_data: 'SILENCE_ALERTS' },
-          { text: '⚙️ sl_set (Change SL)', callback_data: 'OPEN_SL_SET' }
+          { text: '🚨 Emergency Square Off', callback_data: 'FLATTEN' },
+          { text: '🔕 Silence Alerts', callback_data: 'SILENCE_ALERTS' }
         ],
         [
+          { text: '⚙️ Change SL (sl_set)', callback_data: 'OPEN_SL_SET' },
           { text: '🔄 Reset Alerts', callback_data: 'RESET_ALERTS' }
         ]
       ]
@@ -83,7 +93,7 @@ class TelegramService {
   getDefaultReplyKeyboard() {
     return {
       keyboard: [
-        [{ text: '⚙️ sl_set' }, { text: '💰 Update PnL' }],
+        [{ text: '⚙️ sl_set' }, { text: '🚨 Emergency Square Off' }],
         [{ text: '📊 Live Status' }, { text: '🔄 Reset Alerts' }]
       ],
       resize_keyboard: true,
@@ -132,7 +142,7 @@ class TelegramService {
    */
   async startPolling() {
     if (!this.enabled) {
-      console.log('[Telegram] Telegram disabled or credentials missing. Running in local mode.');
+      console.log('[Telegram] Telegram disabled or credentials missing. Running in local console mode.');
       return;
     }
 
@@ -141,10 +151,11 @@ class TelegramService {
 
     // Startup announcement
     await this.sendMessage(
-      '🤖 *Live Execution Stop-Loss Bot Active*\n\n' +
+      '🤖 *Delta India Stop-Loss Monitor Active*\n\n' +
+      `• Checking Portfolio: \`Every 1 minute\`\n` +
       `• Stop-Loss Limit: \`-$${this.monitor?.slAmount.toFixed(2) || '10.00'}\`\n` +
       `• Alert Schedule: \`5 alerts every 10 mins on SL breach\`\n\n` +
-      `Tap *⚙️ sl_set* to customize your SL, or *💰 Update PnL* to update your balance!`,
+      `Tap *⚙️ sl_set* to change your Stop-Loss anytime!`,
       this.getDefaultReplyKeyboard()
     );
 
@@ -199,14 +210,14 @@ class TelegramService {
 
     // 1. "sl_set" Button / Command
     if (lower === 'sl_set' || lower === '⚙️ sl_set' || lower === '/set_sl' || raw === 'OPEN_SL_SET') {
-      this.awaitingInput = 'SL';
+      this.awaitingSlInput = true;
       const currentSL = this.monitor ? this.monitor.slAmount.toFixed(2) : '10.00';
       const currentPnL = this.monitor ? this.monitor.currentPnL.toFixed(2) : '0.00';
 
       const promptText =
-        `⚙️ *Set Stop-Loss Limit*\n\n` +
+        `⚙️ *Set Stop-Loss Limit (Delta India)*\n\n` +
         `• Current Stop-Loss: \`-$${currentSL}\`\n` +
-        `• Current Live PnL: \`$${currentPnL}\`\n\n` +
+        `• Current Live Portfolio PnL: \`$${currentPnL}\`\n\n` +
         `👉 *Select a quick preset below, or reply with any number* (e.g. \`10\` or \`15.5\`):`;
 
       await this.sendMessage(promptText, this.getSlPresetInlineKeyboard());
@@ -218,40 +229,28 @@ class TelegramService {
       const amount = parseFloat(raw.replace('SET_SL:', ''));
       if (!isNaN(amount) && amount > 0 && this.monitor) {
         this.monitor.updateVirtualSL(amount);
-        this.awaitingInput = null;
+        this.awaitingSlInput = false;
         await this.sendMessage(
-          `✅ *Stop-Loss updated to -$${amount.toFixed(2)}!*\n\n` +
-          `You will receive 5 alerts at 10-minute intervals if your loss hits -$${amount.toFixed(2)}.`,
+          `✅ *Stop-Loss Updated to -$${amount.toFixed(2)}!*\n\n` +
+          `Delta India is checked every 1 min. If portfolio loss hits -$${amount.toFixed(2)}, you will receive 5 alerts at 10-minute intervals.`,
           this.getDefaultReplyKeyboard()
         );
       }
       return;
     }
 
-    // 3. "Update PnL" Button / Command
-    if (lower === 'update pnl' || lower === '💰 update pnl' || lower.startsWith('/pnl') || lower.startsWith('pnl ')) {
-      // Check if command included the value: e.g. /pnl -10.5 or pnl -12
-      const parts = raw.split(/\s+/);
-      if (parts.length > 1 && !isNaN(parseFloat(parts[1]))) {
-        const pnl = parseFloat(parts[1]);
-        await this.monitor.updatePnL(pnl);
-        const sign = pnl >= 0 ? '+' : '';
-        await this.sendMessage(`💰 *Live PnL Updated to ${sign}$${pnl.toFixed(2)}*`, this.getDefaultReplyKeyboard());
-        return;
-      }
-
-      this.awaitingInput = 'PNL';
-      await this.sendMessage(
-        `💰 *Update Live Execution PnL*\n\n` +
-        `Reply with your current portfolio PnL value (e.g. \`3.5\` or \`-10.2\`):`,
-        this.getDefaultReplyKeyboard()
-      );
+    // 3. Emergency Square Off
+    if (lower.includes('emergency') || lower.includes('square off') || lower.includes('flatten') || raw === 'FLATTEN') {
+      if (!this.monitor) return;
+      await this.sendMessage('🚨 *EMERGENCY EXIT TRIGGERED!* Closing all open positions on Delta Exchange India...');
+      const result = await this.monitor.emergencySquareOff();
+      await this.sendMessage(`✅ *Emergency square-off completed:* ${JSON.stringify(result)}`, this.getDefaultReplyKeyboard());
       return;
     }
 
     // 4. Cancel Input
     if (raw === 'CANCEL_INPUT') {
-      this.awaitingInput = null;
+      this.awaitingSlInput = false;
       await this.sendMessage('❌ Cancelled.', this.getDefaultReplyKeyboard());
       return;
     }
@@ -283,27 +282,17 @@ class TelegramService {
       return;
     }
 
-    // 8. Handle numerical input when awaiting SL or PnL
-    if (!isNaN(parseFloat(raw))) {
-      const val = parseFloat(raw);
-
-      if (this.awaitingInput === 'SL') {
-        const amount = Math.abs(val);
+    // 8. Handle numerical input when awaiting SL
+    if (this.awaitingSlInput && !isNaN(parseFloat(raw))) {
+      const amount = Math.abs(parseFloat(raw));
+      if (amount > 0 && this.monitor) {
         this.monitor.updateVirtualSL(amount);
-        this.awaitingInput = null;
+        this.awaitingSlInput = false;
         await this.sendMessage(
           `✅ *Stop-Loss updated to -$${amount.toFixed(2)}!*\n\n` +
-          `Alerts will trigger 5 times at 10-min intervals if loss hits -$${amount.toFixed(2)}.`,
+          `You will receive 5 alerts at 10-min intervals if portfolio loss hits -$${amount.toFixed(2)}.`,
           this.getDefaultReplyKeyboard()
         );
-        return;
-      }
-
-      if (this.awaitingInput === 'PNL') {
-        await this.monitor.updatePnL(val);
-        this.awaitingInput = null;
-        const sign = val >= 0 ? '+' : '';
-        await this.sendMessage(`💰 *Live PnL Updated to ${sign}$${val.toFixed(2)}*`, this.getDefaultReplyKeyboard());
         return;
       }
     }

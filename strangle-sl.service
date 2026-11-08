@@ -1,5 +1,5 @@
 [Unit]
-Description=Delta India Strangle Virtual SL Engine & Telegram Bot
+Description=Delta Exchange India Stop-Loss Monitor & Telegram Bot
 After=network.target network-online.target
 Wants=network-online.target
 
@@ -11,22 +11,22 @@ WorkingDirectory=/root/strangle-sl
 Environment=NODE_ENV=production
 EnvironmentFile=-/root/strangle-sl/.env
 
-# Node binary path (adjust if using NVM or custom node path)
+# Node binary path
 ExecStart=/usr/bin/node index.js
 
-# Graceful shutdown (sends SIGINT so bot can log and alert before exit)
+# Graceful stop
 KillSignal=SIGINT
 TimeoutStopSec=30
 KillMode=mixed
 
-# Auto-recovery on failure
+# Auto-recovery
 Restart=always
 RestartSec=5s
 
 # File descriptor limits
 LimitNOFILE=65536
 
-# Logging to systemd journal
+# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=strangle-sl

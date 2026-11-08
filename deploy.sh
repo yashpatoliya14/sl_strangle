@@ -43,7 +43,7 @@ NODE_BIN="$(command -v node || echo /usr/bin/node)"
 
 cat > "${SERVICE_FILE}" <<EOF
 [Unit]
-Description=Delta India Strangle Virtual SL Engine & Telegram Bot
+Description=Delta Exchange India Stop-Loss Monitor & Telegram Bot
 After=network.target network-online.target
 Wants=network-online.target
 

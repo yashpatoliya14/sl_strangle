@@ -1,72 +1,179 @@
 /**
  * slMonitor.js
- * Dedicated Stop-Loss Alerting Engine
- * Tracks Stop-Loss, triggers 5 alerts at 10-minute intervals,
- * and handles dynamic SL updates via Telegram ('sl_set').
+ * Stop-Loss Monitor for Delta Exchange India + Telegram
+ * 
+ * - Polls Delta Exchange India every 1 minute to check overall portfolio PnL.
+ * - Monitors Stop-Loss level (default -$10 or customized live via Telegram 'sl_set').
+ * - Triggers 5 alerts at 10-minute intervals upon SL breach.
  */
 
 class SLMonitor {
   /**
+   * @param {object} deltaClient - Instance of DeltaExchangeClient
    * @param {object} telegram - Instance of TelegramService
-   * @param {object} options - Options from environment
+   * @param {object} options - Configuration options
    */
-  constructor(telegram = null, options = {}) {
+  constructor(deltaClient, telegram = null, options = {}) {
+    this.delta = deltaClient;
     this.telegram = telegram;
 
-    // Stop-Loss limit in $ (e.g. 10 => Virtual SL is -$10.00)
+    // Stop-Loss amount (e.g. 10 means -$10.00 loss threshold)
     this.slAmount = Number(options.defaultSlAmount ?? process.env.DEFAULT_SL_AMOUNT ?? 10);
-    this.virtualSL = -Math.abs(this.slAmount);
+    this.virtualSL = -Math.abs(this.slAmount); // -$10.00
 
-    // Alert Sequence Settings: 5 alerts at 10-minute intervals
+    // Alert Sequence Settings
     this.slAlertIntervalMinutes = Number(options.slAlertIntervalMinutes ?? process.env.SL_ALERT_INTERVAL_MINUTES ?? 10);
     this.maxAlerts = Number(options.maxAlerts ?? process.env.SL_MAX_ALERTS ?? 5);
 
+    // Delta Polling Interval (default: 60000ms = 1 minute)
+    this.pollIntervalMs = Number(options.pollIntervalMs ?? process.env.POLL_INTERVAL_MS ?? 60000);
+
     // Live State
     this.currentPnL = 0;
+    this.positionsCount = 0;
+    this.positionsDetails = [];
     this.isSlBreached = false;
     this.alertsSent = 0;
     this.lastAlertTimestamp = 0;
     this.alertsSilenced = false;
     this.maxAlertsNoticeSent = false;
 
-    // Periodic timer for the 10-minute follow-up alerts
-    this.intervalTimer = null;
+    this.pollTimer = null;
+    this.isRunning = false;
   }
 
   /**
-   * Start the internal check timer (runs every 5 seconds to check 10-min intervals)
+   * Start polling Delta Exchange India on 1-minute interval
    */
-  start() {
+  async start() {
     console.log('\n============================================================');
-    console.log('       🚀 TELEGRAM STOP-LOSS ALERT ENGINE ACTIVE            ');
+    console.log('   🚀 DELTA INDIA STOP-LOSS MONITOR & TELEGRAM BOT ACTIVE   ');
     console.log('============================================================');
-    console.log(` ▸ Current Virtual SL : -$${this.slAmount.toFixed(2)}`);
+    console.log(` ▸ Check Frequency   : Every ${(this.pollIntervalMs / 1000).toFixed(0)} seconds (1 min)`);
+    console.log(` ▸ Active Stop-Loss  : -$${this.slAmount.toFixed(2)} (Adjustable via 'sl_set')`);
     console.log(` ▸ Alert Interval    : Every ${this.slAlertIntervalMinutes} minutes`);
     console.log(` ▸ Max Alerts Limit  : ${this.maxAlerts} alerts`);
     console.log('============================================================\n');
 
-    this.intervalTimer = setInterval(() => this._checkFollowUpAlerts(), 5000);
+    this.isRunning = true;
+
+    // Run first check immediately
+    await this._checkPortfolio();
+
+    // Schedule 1-minute recurring poll
+    this.pollTimer = setInterval(() => this._checkPortfolio(), this.pollIntervalMs);
   }
 
   /**
-   * Stop the internal check timer
+   * Stop polling
    */
   stop() {
-    if (this.intervalTimer) {
-      clearInterval(this.intervalTimer);
-      this.intervalTimer = null;
+    this.isRunning = false;
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
   }
 
   /**
-   * Set reference to Telegram service
+   * 1-Minute Check: Fetches overall portfolio PnL from Delta Exchange India
    */
-  setTelegram(telegram) {
-    this.telegram = telegram;
+  async _checkPortfolio() {
+    if (!this.isRunning) return;
+
+    try {
+      // 1. Fetch live overall portfolio PnL from Delta Exchange India
+      const result = await this.delta.getOverallPortfolioPnL();
+      this.currentPnL = result.totalPnL;
+      this.positionsCount = result.positionsCount;
+      this.positionsDetails = result.details;
+
+      const time = new Date().toLocaleTimeString();
+      const sign = this.currentPnL >= 0 ? '+' : '';
+      console.log(
+        `[${time}] Delta India Portfolio PnL: ${sign}$${this.currentPnL.toFixed(2)} | ` +
+        `Active SL: -$${this.slAmount.toFixed(2)} | Open Positions: ${this.positionsCount}` +
+        (this.isSlBreached ? ` [ALERTS: ${this.alertsSent}/${this.maxAlerts}]` : '')
+      );
+
+      // 2. Check if portfolio loss reaches or breaches Stop-Loss
+      if (this.currentPnL <= this.virtualSL) {
+        const now = Date.now();
+        const alertIntervalMs = this.slAlertIntervalMinutes * 60 * 1000;
+
+        if (!this.isSlBreached) {
+          this.isSlBreached = true;
+          this.alertsSent = 0;
+          this.alertsSilenced = false;
+          this.maxAlertsNoticeSent = false;
+        }
+
+        const isFirstAlert = this.alertsSent === 0;
+        const isFollowUpDue =
+          this.alertsSent < this.maxAlerts &&
+          now - this.lastAlertTimestamp >= alertIntervalMs;
+
+        if (!this.alertsSilenced && (isFirstAlert || isFollowUpDue)) {
+          this.alertsSent++;
+          this.lastAlertTimestamp = now;
+
+          console.log('\n🚨 ============================================================');
+          console.log(`🚨 [ALERT ${this.alertsSent}/${this.maxAlerts}] STOP-LOSS BREACHED!`);
+          console.log(`   Portfolio PnL: $${this.currentPnL.toFixed(2)} <= Stop-Loss: -$${this.slAmount.toFixed(2)}`);
+          if (this.alertsSent < this.maxAlerts) {
+            console.log(`   Next alert in ${this.slAlertIntervalMinutes} minutes.`);
+          }
+          console.log('🚨 ============================================================');
+
+          // Send Telegram Alert
+          if (this.telegram && this.telegram.enabled) {
+            await this.telegram.sendSlBreachAlert({
+              alertNumber: this.alertsSent,
+              maxAlerts: this.maxAlerts,
+              currentPnL: this.currentPnL,
+              slAmount: this.slAmount,
+              positionsCount: this.positionsCount,
+              details: this.positionsDetails,
+              nextIntervalMins: this.slAlertIntervalMinutes
+            });
+          }
+        } else if (this.alertsSent >= this.maxAlerts && !this.maxAlertsNoticeSent) {
+          this.maxAlertsNoticeSent = true;
+          console.log(`[SL Engine] Maximum ${this.maxAlerts} alerts reached for this breach cycle.`);
+          if (this.telegram && this.telegram.enabled) {
+            await this.telegram.sendMessage(
+              `⚠️ *SL Alert Limit Reached (${this.maxAlerts}/${this.maxAlerts})*\n\n` +
+              `Portfolio is still in breach at \`$${this.currentPnL.toFixed(2)}\` (SL: -$${this.slAmount.toFixed(2)}).\n` +
+              `No further automated alerts will be sent unless reset.`
+            );
+          }
+        }
+      } else {
+        // Portfolio recovered above Stop-Loss
+        if (this.isSlBreached) {
+          console.log(`\n🟢 [RECOVERY] Portfolio recovered above SL: $${this.currentPnL.toFixed(2)} > -$${this.slAmount.toFixed(2)}`);
+          if (this.telegram && this.telegram.enabled && this.alertsSent > 0) {
+            const sign = this.currentPnL >= 0 ? '+' : '';
+            await this.telegram.sendMessage(
+              `🟢 *Portfolio Recovered Above SL*\n\n` +
+              `• Current PnL: \`${sign}$${this.currentPnL.toFixed(2)}\`\n` +
+              `• Stop-Loss Limit: \`-$${this.slAmount.toFixed(2)}\`\n\n` +
+              `Alert sequence has been paused and reset.`
+            );
+          }
+          this.isSlBreached = false;
+          this.alertsSent = 0;
+          this.alertsSilenced = false;
+          this.maxAlertsNoticeSent = false;
+        }
+      }
+    } catch (err) {
+      console.error('[SL Monitor] Error checking Delta India portfolio:', err.message);
+    }
   }
 
   /**
-   * Update the Stop-Loss amount (Called via Telegram 'sl_set')
+   * Updates the Stop-Loss amount (called from Telegram 'sl_set')
    */
   updateVirtualSL(newAmount) {
     const numeric = Math.abs(Number(newAmount));
@@ -89,110 +196,7 @@ class SLMonitor {
   }
 
   /**
-   * Update the live PnL (from Telegram chat command, webhook, or live feed)
-   */
-  async updatePnL(newPnL) {
-    const numeric = Number(newPnL);
-    if (isNaN(numeric)) {
-      throw new Error('Invalid PnL value.');
-    }
-
-    this.currentPnL = numeric;
-    const time = new Date().toLocaleTimeString();
-    const sign = this.currentPnL >= 0 ? '+' : '';
-    console.log(`[${time}] PnL Update: ${sign}$${this.currentPnL.toFixed(2)} | Virtual SL: -$${this.slAmount.toFixed(2)}`);
-
-    // Check if Stop-Loss is reached / breached
-    if (this.currentPnL <= this.virtualSL) {
-      if (!this.isSlBreached) {
-        this.isSlBreached = true;
-        this.alertsSent = 0;
-        this.alertsSilenced = false;
-        this.maxAlertsNoticeSent = false;
-      }
-
-      // Fire immediate Alert #1
-      if (this.alertsSent === 0 && !this.alertsSilenced) {
-        await this._dispatchAlert();
-      }
-    } else {
-      // PnL recovered above Stop-Loss
-      if (this.isSlBreached) {
-        console.log(`🟢 [RECOVERY] PnL recovered above SL: $${this.currentPnL.toFixed(2)} > -$${this.slAmount.toFixed(2)}`);
-        if (this.telegram && this.telegram.enabled && this.alertsSent > 0) {
-          await this.telegram.sendMessage(
-            `🟢 *Portfolio Recovered Above SL*\n\n` +
-            `• Current PnL: \`${sign}$${this.currentPnL.toFixed(2)}\`\n` +
-            `• Stop-Loss: \`-$${this.slAmount.toFixed(2)}\`\n\n` +
-            `Alert sequence has been reset.`
-          );
-        }
-        this.isSlBreached = false;
-        this.alertsSent = 0;
-        this.alertsSilenced = false;
-        this.maxAlertsNoticeSent = false;
-      }
-    }
-
-    return this.currentPnL;
-  }
-
-  /**
-   * Internal check for subsequent alerts (Alerts 2 to 5 every 10 minutes)
-   */
-  async _checkFollowUpAlerts() {
-    if (!this.isSlBreached || this.alertsSilenced) return;
-
-    if (this.alertsSent >= this.maxAlerts) {
-      if (!this.maxAlertsNoticeSent) {
-        this.maxAlertsNoticeSent = true;
-        console.log(`[SL Engine] Maximum ${this.maxAlerts} alerts reached. Halting alerts.`);
-        if (this.telegram && this.telegram.enabled) {
-          await this.telegram.sendMessage(
-            `⚠️ *SL Alert Limit Reached*\n\n` +
-            `Sent all ${this.maxAlerts} alerts. Current PnL remains in breach at \`$${this.currentPnL.toFixed(2)}\` (SL: -$${this.slAmount.toFixed(2)}).`
-          );
-        }
-      }
-      return;
-    }
-
-    const now = Date.now();
-    const intervalMs = this.slAlertIntervalMinutes * 60 * 1000;
-
-    if (now - this.lastAlertTimestamp >= intervalMs) {
-      await this._dispatchAlert();
-    }
-  }
-
-  /**
-   * Sends alert to Telegram and console
-   */
-  async _dispatchAlert() {
-    this.alertsSent++;
-    this.lastAlertTimestamp = Date.now();
-
-    console.log('\n🚨 ============================================================');
-    console.log(`🚨 [ALERT ${this.alertsSent}/${this.maxAlerts}] STOP-LOSS BREACHED!`);
-    console.log(`   Current PnL: $${this.currentPnL.toFixed(2)} <= Stop-Loss: -$${this.slAmount.toFixed(2)}`);
-    if (this.alertsSent < this.maxAlerts) {
-      console.log(`   Next alert in ${this.slAlertIntervalMinutes} minutes.`);
-    }
-    console.log('🚨 ============================================================');
-
-    if (this.telegram && this.telegram.enabled) {
-      await this.telegram.sendSlBreachAlert({
-        alertNumber: this.alertsSent,
-        maxAlerts: this.maxAlerts,
-        currentPnL: this.currentPnL,
-        slAmount: this.slAmount,
-        nextIntervalMins: this.slAlertIntervalMinutes
-      });
-    }
-  }
-
-  /**
-   * Silence remaining alerts
+   * Silence remaining alerts for current breach
    */
   silenceAlerts() {
     this.alertsSilenced = true;
@@ -201,7 +205,7 @@ class SLMonitor {
   }
 
   /**
-   * Reset the alert sequence
+   * Reset alert counter and breach state
    */
   reset() {
     this.isSlBreached = false;
@@ -214,21 +218,40 @@ class SLMonitor {
   }
 
   /**
-   * Live Status string for Telegram
+   * Emergency Square-off of all positions on Delta India
+   */
+  async emergencySquareOff() {
+    console.log('[SL Engine] Executing emergency square-off on Delta India...');
+    const result = await this.delta.closeAllPositions();
+    this.reset();
+    return result;
+  }
+
+  /**
+   * Format Live Status for Telegram
    */
   getStatusSummary() {
     const sign = this.currentPnL >= 0 ? '+' : '';
     const distanceToSL = Math.abs(this.currentPnL - this.virtualSL);
-    const statusText = this.isSlBreached ? '🚨 BREACHED' : '🟢 NORMAL';
+    const statusText = this.isSlBreached ? '🚨 SL BREACHED' : '🟢 NORMAL';
+
+    let detailsStr = '';
+    if (this.positionsDetails && this.positionsDetails.length > 0) {
+      detailsStr = '\n\n*Open Positions:*\n' + this.positionsDetails.map(p => {
+        const pSign = p.pnl >= 0 ? '+' : '';
+        return `• \`${p.symbol}\` (${p.side} ${Math.abs(p.size)}): ${pSign}$${p.pnl.toFixed(2)}`;
+      }).join('\n');
+    }
 
     return (
-      `📊 *Live Stop-Loss Status*\n\n` +
+      `📊 *Delta India Portfolio Status*\n\n` +
       `• *Status:* ${statusText}\n` +
-      `• *Current PnL:* \`${sign}$${this.currentPnL.toFixed(2)}\`\n` +
-      `• *Stop-Loss Limit:* \`-$${this.slAmount.toFixed(2)}\`\n` +
-      `• *Distance to SL:* \`$${distanceToSL.toFixed(2)}\`\n\n` +
-      `• *Alert Sequence:* \`${this.alertsSent}/${this.maxAlerts} sent\`\n` +
-      `• *Alert Interval:* \`Every ${this.slAlertIntervalMinutes} mins\``
+      `• *Total Portfolio PnL:* \`${sign}$${this.currentPnL.toFixed(2)}\`\n` +
+      `• *Active Stop-Loss:* \`-$${this.slAmount.toFixed(2)}\`\n` +
+      `• *Distance to SL:* \`$${distanceToSL.toFixed(2)}\`\n` +
+      `• *Alerts Sent:* \`${this.alertsSent}/${this.maxAlerts}\` (Interval: ${this.slAlertIntervalMinutes}m)\n` +
+      `• *Check Frequency:* \`1 minute\`` +
+      detailsStr
     );
   }
 }
