@@ -1,0 +1,23 @@
+{
+  "name": "smart-strangle-sl",
+  "version": "1.0.0",
+  "description": "Smart Virtual Combined Stop-Loss and Target Profit monitor for Options Strangles",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "options",
+    "strangle",
+    "stop-loss",
+    "virtual-sl",
+    "trading",
+    "node"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.21.0",
+    "dotenv": "^16.4.7"
+  }
+}
